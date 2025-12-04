@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+env/
+ENV/
+.Python
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.env
+pip-wheel-metadata/
+dist/
+build/
