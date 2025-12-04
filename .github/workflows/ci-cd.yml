@@ -1,28 +1,41 @@
-name: CI/CD - FastAPI Deploy
+name: CI/CD - rsync & docker-compose deploy
 
 on:
   push:
     branches: [ "main" ]
 
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup SSH
+      - name: Set up SSH key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/server_key
+          chmod 600 ~/.ssh/server_key
+          ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts
+        shell: bash
 
-      - name: Sync files to EC2
+      - name: Upload project to server (rsync)
         run: |
-          rsync -avz --delete --exclude='.git' ./ ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ secrets.DEPLOY_PATH }}
+          rsync -avz --delete --exclude='.git' --exclude='.github' ./ \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ secrets.DEPLOY_PATH }}
+        shell: bash
 
-      - name: Deploy with Docker Compose
+      - name: Deploy on server using docker compose
         run: |
-          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} "cd ${{ secrets.DEPLOY_PATH }} && docker compose build --no-cache && docker compose up -d --remove-orphans"
+          ssh -i ~/.ssh/server_key ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            cd "${DEPLOY_PATH:-/home/ubuntu/app}"
+
+            # build & run containers
+            docker compose up -d --build --remove-orphans
+
+            docker ps
+          EOF
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        shell: bash
