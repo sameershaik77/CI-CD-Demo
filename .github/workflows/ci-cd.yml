@@ -2,40 +2,73 @@ name: CI/CD - rsync & docker-compose deploy
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST }}
+      SERVER_USER: ${{ secrets.SERVER_USER }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up SSH key
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/server_key
-          chmod 600 ~/.ssh/server_key
-          ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts
+          set -euo pipefail
+          echo "Creating SSH directory..."
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "ERROR: SSH_PRIVATE_KEY secret is empty or missing" >&2
+            exit 1
+          fi
+
+          # write private key (strip CRLF if present)
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" | sed 's/\r$//' > "$HOME/.ssh/id_rsa"
+          chmod 600 "$HOME/.ssh/id_rsa"
+
+          # known_hosts: prefer secret, else use ssh-keyscan
+          if [ -n "${{ secrets.KNOWN_HOSTS || '' }}" ]; then
+            echo "Using known hosts from secret"
+            echo "${{ secrets.KNOWN_HOSTS }}" | sed 's/\r$//' > "$HOME/.ssh/known_hosts"
+          else
+            echo "Generating known_hosts for ${{ secrets.SERVER_HOST }}"
+            ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+          fi
+          chmod 644 "$HOME/.ssh/known_hosts"
         shell: bash
+
+      - name: Ensure rsync installed
+        run: sudo apt-get update && sudo apt-get install -y rsync
 
       - name: Upload project to server (rsync)
         run: |
-          rsync -avz --delete --exclude='.git' --exclude='.github' ./ \
-            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ secrets.DEPLOY_PATH }}
+          set -euo pipefail
+          echo "Rsync to server ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH} ..."
+          rsync -avz --delete --exclude '.git' -e "ssh -i $HOME/.ssh/id_rsa -o StrictHostKeyChecking=yes" ./ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}
         shell: bash
 
       - name: Deploy on server using docker compose
         run: |
-          ssh -i ~/.ssh/server_key ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
-            cd "${DEPLOY_PATH:-/home/ubuntu/app}"
-
-            # build & run containers
-            docker compose up -d --build --remove-orphans
-
-            docker ps
-          EOF
-        env:
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          set -euo pipefail
+          ssh -i "$HOME/.ssh/id_rsa" -o StrictHostKeyChecking=yes ${SERVER_USER}@${SERVER_HOST} <<'SSH_EOF'
+            set -euo pipefail
+            # ensure deploy dir exists
+            mkdir -p ${DEPLOY_PATH}
+            cd ${DEPLOY_PATH}
+            # stop previous containers (if any)
+            docker compose down || true
+            # build or pull and start
+            docker compose pull || true
+            docker compose up -d --build
+            docker compose ps
+SSH_EOF
         shell: bash
