@@ -1,74 +1,53 @@
-name: CI/CD - rsync & docker-compose deploy
+name: CI/CD - Build & Deploy
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
+
+env:
+  IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/myapp:${{ github.sha }}
 
 jobs:
-  build-and-deploy:
+  build-and-test:
     runs-on: ubuntu-latest
-    env:
-      SERVER_HOST: ${{ secrets.SERVER_HOST }}
-      SERVER_USER: ${{ secrets.SERVER_USER }}
-      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up JDK 17   # example for Java backend; adapt for node, python
+        uses: actions/setup-java@v4
         with:
-          persist-credentials: false
+          distribution: 'temurin'
+          java-version: '17'
 
-      - name: Set up SSH key
+      - name: Build & Test
         run: |
-          set -euo pipefail
-          echo "Creating SSH directory..."
-          mkdir -p "$HOME/.ssh"
-          chmod 700 "$HOME/.ssh"
+          ./gradlew clean build   # or npm test, pytest, etc.
 
-          if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
-            echo "ERROR: SSH_PRIVATE_KEY secret is empty or missing" >&2
-            exit 1
-          fi
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-          # write private key (strip CRLF if present)
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" | sed 's/\r$//' > "$HOME/.ssh/id_rsa"
-          chmod 600 "$HOME/.ssh/id_rsa"
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}
 
-          # known_hosts: prefer secret, else use ssh-keyscan
-          if [ -n "${{ secrets.KNOWN_HOSTS || '' }}" ]; then
-            echo "Using known hosts from secret"
-            echo "${{ secrets.KNOWN_HOSTS }}" | sed 's/\r$//' > "$HOME/.ssh/known_hosts"
-          else
-            echo "Generating known_hosts for ${{ secrets.SERVER_HOST }}"
-            ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
-          fi
-          chmod 644 "$HOME/.ssh/known_hosts"
-        shell: bash
-
-      - name: Ensure rsync installed
-        run: sudo apt-get update && sudo apt-get install -y rsync
-
-      - name: Upload project to server (rsync)
-        run: |
-          set -euo pipefail
-          echo "Rsync to server ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH} ..."
-          rsync -avz --delete --exclude '.git' -e "ssh -i $HOME/.ssh/id_rsa -o StrictHostKeyChecking=yes" ./ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}
-        shell: bash
-
-      - name: Deploy on server using docker compose
-        run: |
-          set -euo pipefail
-          ssh -i "$HOME/.ssh/id_rsa" -o StrictHostKeyChecking=yes ${SERVER_USER}@${SERVER_HOST} <<'SSH_EOF'
-            set -euo pipefail
-            # ensure deploy dir exists
-            mkdir -p ${DEPLOY_PATH}
-            cd ${DEPLOY_PATH}
-            # stop previous containers (if any)
-            docker compose down || true
-            # build or pull and start
-            docker compose pull || true
-            docker compose up -d --build
-            docker compose ps
-SSH_EOF
-        shell: bash
+      - name: Copy deploy artifacts and run remote deploy (via SSH)
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /home/ubuntu/deploy
+            docker pull ${{ env.IMAGE }}
+            docker stop myapp || true
+            docker rm myapp || true
+            docker run -d --name myapp --restart=always -p 8080:8080 \
+              -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+              ${{ env.IMAGE }}
